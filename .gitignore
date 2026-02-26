@@ -1,0 +1,30 @@
+# Build directories
+build/
+sdkconfig.old
+
+# Managed components (downloaded by IDF)
+managed_components/
+
+# Demo firmware (not our code)
+demo_fw/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# Theos build output (tweak is built in CI)
+ios_tweak/NavRelay/.theos/
+ios_tweak/NavRelay/packages/
+ios_tweak/NavRelay/obj/
+*.bak*

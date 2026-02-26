@@ -1,0 +1,1 @@
+{ Filter = { Bundles = ( "com.apple.Maps", "com.google.Maps", "ru.yandex.yandexnavi", "ru.yandex.mobile.navigator", "ru.dublgis.dgismobile", "com.waze.iphone" ); }; }
