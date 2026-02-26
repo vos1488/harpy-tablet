@@ -1,14 +1,16 @@
 /*
- * NavRelay v1.2.0 — Jailbreak Tweak for relaying turn-by-turn navigation
- *                    from iPhone to HARPY Remote (ESP32) via custom BLE GATT.
+ * NavRelay v1.3.0 — Universal window-scanning approach.
  *
- * ARCHITECTURE:
- *   - %group per app (Apple Maps / Google Maps / Yandex)
- *   - %init only for classes that EXIST at runtime (no crash on missing class)
- *   - NO dealloc hooks (dangerous with Substrate)
- *   - NO layout hooks (viewDidLayoutSubviews / layoutSubviews)
- *   - Single global NSTimer polls the active navigation VC
- *   - Weak references everywhere to avoid retain cycles
+ * Instead of hooking app-specific classes (which change every version),
+ * we use a single global NSTimer that scans the entire keyWindow
+ * view hierarchy for navigation-like UILabel texts.
+ *
+ * Works for ANY navigation app without knowing class names.
+ *
+ * NO %hook on app-specific classes.
+ * NO dealloc hooks.
+ * NO layout hooks.
+ * Just a timer + window scan.
  *
  * Service UUID:  E6A30000-B5A3-F393-E0A9-E50E24DCCA9E
  * Nav Data UUID: E6A30001-B5A3-F393-E0A9-E50E24DCCA9E
@@ -19,22 +21,6 @@
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-
-/* ==================== Forward Declarations ==================== */
-/* Must declare with proper superclass so compiler knows about
- * inherited properties like .window, .view, .isViewLoaded */
-
-@interface MNStepCardViewController : UIViewController
-@end
-
-@interface MNNavigationViewController : UIViewController
-@end
-
-@interface GMSNavigationBannerView : UIView
-@end
-
-@interface YMKTurnInstructionView : UIView
-@end
 
 /* ==================== Constants ==================== */
 
@@ -128,12 +114,29 @@ typedef NS_ENUM(NSInteger, NavDirection) {
         retrieveConnectedPeripheralsWithServices:@[hidSvc]];
     for (CBPeripheral *p in connected) {
         if ([p.name containsString:@"HARPY"]) {
+            NSLog(@"[NavRelay] Found HARPY via HID: %@", p.name);
             self.connectedPeripheral = p;
             p.delegate = self;
             [self.centralManager connectPeripheral:p options:nil];
             return;
         }
     }
+
+    /* Also try Nav service UUID directly */
+    CBUUID *navSvc = [CBUUID UUIDWithString:kNavServiceUUID];
+    NSArray *navConnected = [self.centralManager
+        retrieveConnectedPeripheralsWithServices:@[navSvc]];
+    for (CBPeripheral *p in navConnected) {
+        if ([p.name containsString:@"HARPY"]) {
+            NSLog(@"[NavRelay] Found HARPY via Nav svc: %@", p.name);
+            self.connectedPeripheral = p;
+            p.delegate = self;
+            [self.centralManager connectPeripheral:p options:nil];
+            return;
+        }
+    }
+
+    NSLog(@"[NavRelay] Scanning for HARPY...");
     [self.centralManager scanForPeripheralsWithServices:nil options:nil];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
                    dispatch_get_global_queue(0, 0), ^{
@@ -142,6 +145,7 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
+    NSLog(@"[NavRelay] BLE state: %ld", (long)central.state);
     if (central.state == CBManagerStatePoweredOn) [self tryConnect];
 }
 
@@ -150,6 +154,7 @@ typedef NS_ENUM(NSInteger, NavDirection) {
     advertisementData:(NSDictionary *)ad RSSI:(NSNumber *)RSSI {
     NSString *name = peripheral.name ?: ad[CBAdvertisementDataLocalNameKey];
     if ([name containsString:@"HARPY"]) {
+        NSLog(@"[NavRelay] Discovered HARPY: %@ RSSI=%@", name, RSSI);
         [central stopScan];
         self.connectedPeripheral = peripheral;
         peripheral.delegate = self;
@@ -159,21 +164,31 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 
 - (void)centralManager:(CBCentralManager *)central
     didConnectPeripheral:(CBPeripheral *)peripheral {
+    NSLog(@"[NavRelay] Connected to %@, discovering nav service...", peripheral.name);
     [peripheral discoverServices:@[[CBUUID UUIDWithString:kNavServiceUUID]]];
 }
 
 - (void)centralManager:(CBCentralManager *)central
     didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    NSLog(@"[NavRelay] Disconnected: %@", error);
     self.isReady = NO;
     self.navCharacteristic = nil;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_global_queue(0, 0), ^{ [self tryConnect]; });
 }
 
+- (void)centralManager:(CBCentralManager *)central
+    didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    NSLog(@"[NavRelay] Failed to connect: %@", error);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(0, 0), ^{ [self tryConnect]; });
+}
+
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
-    if (error) return;
+    if (error) { NSLog(@"[NavRelay] Svc err: %@", error); return; }
     CBUUID *svcUUID = [CBUUID UUIDWithString:kNavServiceUUID];
     for (CBService *svc in peripheral.services) {
+        NSLog(@"[NavRelay] Found svc: %@", svc.UUID);
         if ([svc.UUID isEqual:svcUUID])
             [peripheral discoverCharacteristics:
                 @[[CBUUID UUIDWithString:kNavDataUUID]] forService:svc];
@@ -182,13 +197,13 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 
 - (void)peripheral:(CBPeripheral *)peripheral
     didDiscoverCharacteristicsForService:(CBService *)service error:(NSError *)error {
-    if (error) return;
+    if (error) { NSLog(@"[NavRelay] Chr err: %@", error); return; }
     CBUUID *chrUUID = [CBUUID UUIDWithString:kNavDataUUID];
     for (CBCharacteristic *chr in service.characteristics) {
         if ([chr.UUID isEqual:chrUUID]) {
             self.navCharacteristic = chr;
             self.isReady = YES;
-            NSLog(@"[NavRelay] *** READY ***");
+            NSLog(@"[NavRelay] *** READY — Nav characteristic found ***");
             if (self.pendingData) {
                 [self sendNavData:self.pendingData];
                 self.pendingData = nil;
@@ -209,49 +224,63 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 static NavDirection parseDirection(NSString *text) {
     if (!text) return NavDirectionStraight;
     NSString *l = [text lowercaseString];
+    /* Check specific phrases first (before generic left/right) */
     if ([l containsString:@"плавно налево"] || [l containsString:@"левее"] ||
-        [l containsString:@"slight left"] || [l containsString:@"bear left"])
+        [l containsString:@"slight left"] || [l containsString:@"bear left"] ||
+        [l containsString:@"keep left"])
         return NavDirectionSlightLeft;
     if ([l containsString:@"плавно направо"] || [l containsString:@"правее"] ||
-        [l containsString:@"slight right"] || [l containsString:@"bear right"])
+        [l containsString:@"slight right"] || [l containsString:@"bear right"] ||
+        [l containsString:@"keep right"])
         return NavDirectionSlightRight;
     if ([l containsString:@"налево"] || [l containsString:@"лево"] ||
-        [l containsString:@"turn left"] || [l containsString:@" left"])
+        [l containsString:@"turn left"] || [l containsString:@"left"])
         return NavDirectionLeft;
     if ([l containsString:@"направо"] || [l containsString:@"право"] ||
-        [l containsString:@"turn right"] || [l containsString:@" right"])
+        [l containsString:@"turn right"] || [l containsString:@"right"])
         return NavDirectionRight;
     if ([l containsString:@"развернитесь"] || [l containsString:@"разворот"] ||
-        [l containsString:@"u-turn"] || [l containsString:@"u turn"])
+        [l containsString:@"u-turn"] || [l containsString:@"u turn"] ||
+        [l containsString:@"make a u"])
         return NavDirectionUTurn;
     if ([l containsString:@"прибыли"] || [l containsString:@"место назначения"] ||
-        [l containsString:@"arrive"] || [l containsString:@"destination"])
+        [l containsString:@"arrive"] || [l containsString:@"destination"] ||
+        [l containsString:@"you have reached"])
         return NavDirectionArrive;
     if ([l containsString:@"круговое"] || [l containsString:@"кольц"] ||
-        [l containsString:@"roundabout"])
+        [l containsString:@"roundabout"] || [l containsString:@"rotary"])
         return NavDirectionRoundabout;
     if ([l containsString:@"прямо"] || [l containsString:@"straight"] ||
-        [l containsString:@"continue"])
+        [l containsString:@"continue"] || [l containsString:@"head"])
         return NavDirectionStraight;
     return NavDirectionStraight;
 }
 
-/* De-duplicate and send */
 static NSString *s_lastInstruction = nil;
+static NSString *s_appName = nil;
 
-static void sendManeuver(NSString *instruction, NSString *distance,
-                         NSString *street, NSString *appName) {
+static void sendManeuver(NSString *instruction, NSString *distance, NSString *street) {
     if (!instruction || instruction.length == 0) return;
     if (s_lastInstruction && [instruction isEqualToString:s_lastInstruction]) return;
     s_lastInstruction = [instruction copy];
     NavDirection dir = parseDirection(instruction);
     NSString *data = [NSString stringWithFormat:@"%ld|%@|%@|%@|||%@",
                       (long)dir, distance ?: @"", instruction ?: @"",
-                      street ?: @"", appName ?: @"Maps"];
+                      street ?: @"", s_appName ?: @"Maps"];
     [[NavRelayBLE shared] sendNavData:data];
+    NSLog(@"[NavRelay] >>> Sent: %@", data);
 }
 
-/* ==================== Safe View Scanners ==================== */
+/* ==================== Universal Window Scanner ==================== */
+/*
+ * Scans the entire keyWindow view hierarchy for UILabels.
+ * Collects ALL visible labels, then categorizes:
+ *   - Navigation instruction (turn left, continue, etc.)
+ *   - Distance (ends with m, km, mi, ft, м, км)
+ *   - Street name (longer text near nav instruction)
+ *
+ * This works for ANY app — no class name dependency.
+ */
 
 static BOOL isNavText(NSString *t) {
     if (!t || t.length < 3 || t.length > 300) return NO;
@@ -260,273 +289,191 @@ static BOOL isNavText(NSString *t) {
             [l containsString:@"left"] || [l containsString:@"right"] ||
             [l containsString:@"arrive"] || [l containsString:@"head"] ||
             [l containsString:@"merge"] || [l containsString:@"exit"] ||
+            [l containsString:@"keep"] || [l containsString:@"onto"] ||
+            [l containsString:@"take"] || [l containsString:@"ramp"] ||
+            [l containsString:@"fork"] || [l containsString:@"stay"] ||
+            [l containsString:@"roundabout"] || [l containsString:@"u-turn"] ||
             [l containsString:@"поверн"] || [l containsString:@"прямо"] ||
             [l containsString:@"налево"] || [l containsString:@"направо"] ||
-            [l containsString:@"развор"] || [l containsString:@"съезд"]);
+            [l containsString:@"развор"] || [l containsString:@"съезд"] ||
+            [l containsString:@"через"] || [l containsString:@"выезд"]);
 }
 
 static BOOL isDistanceText(NSString *t) {
     if (!t || t.length < 2 || t.length > 30) return NO;
     NSString *l = [t lowercaseString];
-    return ([l hasSuffix:@" m"] || [l hasSuffix:@" km"] ||
-            [l hasSuffix:@" mi"] || [l hasSuffix:@" ft"] ||
-            [l hasSuffix:@" м"] || [l hasSuffix:@" км"]);
+    /* Check suffix patterns */
+    if ([l hasSuffix:@" m"] || [l hasSuffix:@" km"] ||
+        [l hasSuffix:@" mi"] || [l hasSuffix:@" ft"] ||
+        [l hasSuffix:@" м"] || [l hasSuffix:@" км"] ||
+        [l hasSuffix:@" yd"] || [l hasSuffix:@" mi"]) return YES;
+    /* Also check patterns like "100m", "2.5km", "500 м" */
+    NSRange r = [l rangeOfString:@"\\d+\\s*(m|km|mi|ft|м|км|yd)$"
+                         options:NSRegularExpressionSearch];
+    return r.location != NSNotFound;
 }
 
-static NSString *findLabel(UIView *root, NSInteger depth, BOOL wantDistance) {
-    if (!root || depth <= 0) return nil;
+static BOOL isEtaText(NSString *t) {
+    if (!t || t.length < 3 || t.length > 30) return NO;
+    NSString *l = [t lowercaseString];
+    return ([l containsString:@"min"] || [l containsString:@"мин"] ||
+            [l containsString:@"hr"] || [l containsString:@"час"] ||
+            [l containsString:@"eta"] ||
+            [l rangeOfString:@"\\d{1,2}:\\d{2}" options:NSRegularExpressionSearch].location != NSNotFound);
+}
+
+/* Collect all visible labels from a view hierarchy (max depth 8) */
+static void collectLabels(UIView *root, NSInteger depth,
+                          NSMutableArray *navLabels,
+                          NSMutableArray *distLabels,
+                          NSMutableArray *etaLabels,
+                          NSMutableArray *otherLabels) {
+    if (!root || depth <= 0) return;
     @try {
+        /* Skip hidden views */
+        if (root.isHidden || root.alpha < 0.1) return;
+
         NSArray *subs = [root.subviews copy];
         for (UIView *sub in subs) {
             if ([sub isKindOfClass:[UILabel class]]) {
-                NSString *text = ((UILabel *)sub).text;
-                if (wantDistance ? isDistanceText(text) : isNavText(text))
-                    return text;
+                UILabel *lbl = (UILabel *)sub;
+                if (lbl.isHidden || lbl.alpha < 0.1) continue;
+                NSString *text = lbl.text;
+                if (!text || text.length < 2) continue;
+
+                if (isNavText(text)) {
+                    [navLabels addObject:text];
+                } else if (isDistanceText(text)) {
+                    [distLabels addObject:text];
+                } else if (isEtaText(text)) {
+                    [etaLabels addObject:text];
+                } else if (text.length > 2 && text.length < 100) {
+                    [otherLabels addObject:text];
+                }
             }
-            NSString *found = findLabel(sub, depth - 1, wantDistance);
-            if (found) return found;
+            collectLabels(sub, depth - 1, navLabels, distLabels, etaLabels, otherLabels);
         }
     } @catch (NSException *e) { }
-    return nil;
 }
 
-/* ==================== Global Polling Timer ==================== */
-/*
- * Single NSTimer on main run loop. Polls the currently tracked VC/View.
- * Weak references — if the VC dies, we just nil-out and wait for the next one.
- * NO associated objects, NO dealloc hooks.
- */
+/* Get the key window (works on iOS 13+) */
+static UIWindow *getKeyWindow(void) {
+    @try {
+        /* iOS 15+ */
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            if (ws.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ws.windows) {
+                if (w.isKeyWindow) return w;
+            }
+        }
+    } @catch (NSException *e) { }
+    /* Fallback */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication sharedApplication].keyWindow;
+#pragma clang diagnostic pop
+}
+
+/* ==================== Global Poll Timer ==================== */
 
 static NSTimer *s_pollTimer = nil;
-static __weak UIViewController *s_activeNavVC = nil;
-static __weak UIView *s_activeNavView = nil;
-static NSString *s_activeApp = nil;
+static NSInteger s_emptyPollCount = 0;
 
-static void pollNavData(void) {
+static void pollWindowForNav(void) {
     @try {
-        NSString *instruction = nil;
-        NSString *distance = nil;
-        NSString *street = nil;
+        UIWindow *win = getKeyWindow();
+        if (!win) return;
 
-        /* Apple Maps: try KVC on the VC first */
-        UIViewController *vc = s_activeNavVC;
-        if (vc) {
-            @try {
-                id step = [vc valueForKey:@"currentStep"];
-                if (step) {
-                    instruction = [step valueForKey:@"instruction"];
-                    distance = [step valueForKey:@"distanceString"];
-                    street = [step valueForKey:@"roadName"];
+        NSMutableArray *navLabels = [NSMutableArray array];
+        NSMutableArray *distLabels = [NSMutableArray array];
+        NSMutableArray *etaLabels = [NSMutableArray array];
+        NSMutableArray *otherLabels = [NSMutableArray array];
+
+        collectLabels(win, 8, navLabels, distLabels, etaLabels, otherLabels);
+
+        if (navLabels.count > 0) {
+            s_emptyPollCount = 0;
+            NSString *instruction = navLabels.firstObject;
+            NSString *distance = distLabels.count > 0 ? distLabels.firstObject : nil;
+            NSString *street = nil;
+
+            /* Try to find a street name from other labels
+             * (usually near the nav instruction, short-ish text) */
+            for (NSString *t in otherLabels) {
+                if (t.length > 3 && t.length < 80 &&
+                    ![t isEqualToString:instruction] &&
+                    !isDistanceText(t) && !isEtaText(t)) {
+                    street = t;
+                    break;
                 }
-            } @catch (NSException *e) { }
-
-            if (!instruction) {
-                @try {
-                    id maneuver = [vc valueForKey:@"maneuver"];
-                    if (maneuver) {
-                        instruction = [maneuver valueForKey:@"instructionString"];
-                        if (!distance)
-                            distance = [maneuver valueForKey:@"distanceRemainingString"];
-                        if (!street)
-                            street = [maneuver valueForKey:@"name"];
-                    }
-                } @catch (NSException *e) { }
             }
 
-            /* Fallback: scan VC's view */
-            if (!instruction && vc.isViewLoaded) {
-                instruction = findLabel(vc.view, 5, NO);
-                if (!distance) distance = findLabel(vc.view, 5, YES);
+            sendManeuver(instruction, distance, street);
+        } else {
+            /* No nav labels found — might have stopped navigating */
+            s_emptyPollCount++;
+            if (s_emptyPollCount > 10 && s_lastInstruction) {
+                /* 10 empty polls (20 sec) → assume navigation ended */
+                NSLog(@"[NavRelay] No nav labels for 20s, sending NAV_END");
+                [[NavRelayBLE shared] sendNavEnd];
+                s_lastInstruction = nil;
             }
-        }
-
-        /* Google Maps / Yandex: scan the tracked UIView */
-        UIView *v = s_activeNavView;
-        if (!instruction && v && v.window) {
-            instruction = findLabel(v, 4, NO);
-            if (!distance) distance = findLabel(v, 4, YES);
-        }
-
-        if (instruction) {
-            sendManeuver(instruction, distance, street, s_activeApp);
         }
     } @catch (NSException *e) {
         NSLog(@"[NavRelay] Poll error: %@", e);
     }
 }
 
-static void ensurePollTimer(void) {
-    if (s_pollTimer && [s_pollTimer isValid]) return;
-    s_pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
-                                                 repeats:YES
-                                                   block:^(NSTimer *t) {
-        pollNavData();
-    }];
-    NSLog(@"[NavRelay] Global poll timer started");
-}
-
-static void stopPollTimerIfIdle(void) {
-    if (!s_activeNavVC && !s_activeNavView) {
-        [s_pollTimer invalidate];
-        s_pollTimer = nil;
-        NSLog(@"[NavRelay] Global poll timer stopped (idle)");
-    }
-}
-
-/* ==================== %group AppleMaps ==================== */
-/*
- * Only %init'd if MNStepCardViewController exists at runtime.
- * Hooks viewDidAppear / viewWillDisappear — safe lifecycle methods.
- * NO viewDidLayoutSubviews, NO dealloc.
- */
-
-%group AppleMaps
-
-%hook MNStepCardViewController
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    s_activeNavVC = (UIViewController *)self;
-    s_activeApp = @"Apple Maps";
-    ensurePollTimer();
-    NSLog(@"[NavRelay] Apple Maps step card appeared");
-}
-
-- (void)viewWillDisappear:(BOOL)animated {
-    if (s_activeNavVC == (UIViewController *)self) {
-        s_activeNavVC = nil;
-        stopPollTimerIfIdle();
-    }
-    %orig;
-}
-
-%end
-
-%hook MNNavigationViewController
-
-- (void)viewDidDisappear:(BOOL)animated {
-    %orig;
-    s_activeNavVC = nil;
-    s_activeNavView = nil;
-    stopPollTimerIfIdle();
-    [[NavRelayBLE shared] sendNavEnd];
-    s_lastInstruction = nil;
-    NSLog(@"[NavRelay] Apple Maps navigation ended");
-}
-
-%end
-
-%end /* group AppleMaps */
-
-/* ==================== %group GoogleMaps ==================== */
-
-%group GoogleMaps
-
-%hook GMSNavigationBannerView
-
-- (void)didMoveToWindow {
-    %orig;
-    if (self.window) {
-        s_activeNavView = (UIView *)self;
-        s_activeApp = @"Google Maps";
-        ensurePollTimer();
-        NSLog(@"[NavRelay] Google Maps banner appeared");
-    } else {
-        if (s_activeNavView == (UIView *)self) {
-            s_activeNavView = nil;
-            stopPollTimerIfIdle();
-        }
-    }
-}
-
-%end
-
-%end /* group GoogleMaps */
-
-/* ==================== %group YandexNavi ==================== */
-
-%group YandexNavi
-
-%hook YMKTurnInstructionView
-
-- (void)didMoveToWindow {
-    %orig;
-    if (self.window) {
-        s_activeNavView = (UIView *)self;
-        s_activeApp = @"Yandex Navi";
-        ensurePollTimer();
-        NSLog(@"[NavRelay] Yandex turn view appeared");
-    } else {
-        if (s_activeNavView == (UIView *)self) {
-            s_activeNavView = nil;
-            stopPollTimerIfIdle();
-        }
-    }
-}
-
-%end
-
-%end /* group YandexNavi */
-
 /* ==================== Tweak Initialization ==================== */
+/*
+ * NO %hook, NO %group, NO %init(groups).
+ * Just start a timer and scan the window.
+ */
 
 %ctor {
     @autoreleasepool {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (!bid) return;
 
-        BOOL isAppleMaps = [bid isEqualToString:@"com.apple.Maps"];
-        BOOL isGoogleMaps = [bid isEqualToString:@"com.google.Maps"];
-        BOOL isYandex = ([bid isEqualToString:@"ru.yandex.yandexnavi"] ||
-                         [bid isEqualToString:@"ru.yandex.mobile.navigator"]);
-        BOOL is2GIS = [bid isEqualToString:@"ru.dublgis.dgismobile"];
-        BOOL isWaze = [bid isEqualToString:@"com.waze.iphone"];
-
-        if (!isAppleMaps && !isGoogleMaps && !isYandex && !is2GIS && !isWaze)
-            return;
-
-        NSLog(@"[NavRelay] v1.2.0 loaded in %@", bid);
-
-        /*
-         * CRITICAL: Only %init groups whose classes exist at runtime.
-         * Hooking a non-existent class = instant crash.
-         */
-        if (isAppleMaps) {
-            Class cls1 = NSClassFromString(@"MNStepCardViewController");
-            Class cls2 = NSClassFromString(@"MNNavigationViewController");
-            if (cls1 || cls2) {
-                %init(AppleMaps);
-                NSLog(@"[NavRelay] Apple Maps hooks active (MNStepCardVC=%p MNNavVC=%p)",
-                      cls1, cls2);
-            } else {
-                NSLog(@"[NavRelay] Apple Maps classes NOT found — hooks skipped");
-            }
+        NSArray *supportedApps = @[
+            @"com.apple.Maps",
+            @"com.google.Maps",
+            @"ru.yandex.yandexnavi",
+            @"ru.yandex.mobile.navigator",
+            @"ru.dublgis.dgismobile",
+            @"com.waze.iphone"
+        ];
+        BOOL supported = NO;
+        for (NSString *app in supportedApps) {
+            if ([bid isEqualToString:app]) { supported = YES; break; }
         }
+        if (!supported) return;
 
-        if (isGoogleMaps) {
-            Class cls = NSClassFromString(@"GMSNavigationBannerView");
-            if (cls) {
-                %init(GoogleMaps);
-                NSLog(@"[NavRelay] Google Maps hooks active");
-            } else {
-                NSLog(@"[NavRelay] GMSNavigationBannerView NOT found — hooks skipped");
-            }
-        }
+        /* Determine friendly app name */
+        if ([bid hasPrefix:@"com.apple.Maps"]) s_appName = @"Apple Maps";
+        else if ([bid hasPrefix:@"com.google"]) s_appName = @"Google Maps";
+        else if ([bid hasPrefix:@"ru.yandex"]) s_appName = @"Yandex Navi";
+        else if ([bid hasPrefix:@"ru.dublgis"]) s_appName = @"2GIS";
+        else if ([bid hasPrefix:@"com.waze"]) s_appName = @"Waze";
+        else s_appName = @"Maps";
 
-        if (isYandex || is2GIS) {
-            Class cls = NSClassFromString(@"YMKTurnInstructionView");
-            if (cls) {
-                %init(YandexNavi);
-                NSLog(@"[NavRelay] Yandex hooks active");
-            } else {
-                NSLog(@"[NavRelay] YMKTurnInstructionView NOT found — hooks skipped");
-            }
-        }
+        NSLog(@"[NavRelay] v1.3.0 loaded in %@ (%@)", bid, s_appName);
 
-        /* Delayed BLE init */
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+        /* Start poll timer after app is fully loaded (5 sec delay) */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{
+            /* Init BLE */
             [[NavRelayBLE shared] ensureBLE];
+
+            /* Start the universal window scanner (every 2 seconds) */
+            s_pollTimer = [NSTimer scheduledTimerWithTimeInterval:2.0
+                                                         repeats:YES
+                                                           block:^(NSTimer *t) {
+                pollWindowForNav();
+            }];
+            NSLog(@"[NavRelay] Universal window scanner started (2s interval)");
         });
     }
 }
