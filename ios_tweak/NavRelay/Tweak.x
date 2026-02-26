@@ -20,6 +20,22 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+/* ==================== Forward Declarations ==================== */
+/* Must declare with proper superclass so compiler knows about
+ * inherited properties like .window, .view, .isViewLoaded */
+
+@interface MNStepCardViewController : UIViewController
+@end
+
+@interface MNNavigationViewController : UIViewController
+@end
+
+@interface GMSNavigationBannerView : UIView
+@end
+
+@interface YMKTurnInstructionView : UIView
+@end
+
 /* ==================== Constants ==================== */
 
 static NSString *const kNavServiceUUID = @"E6A30000-B5A3-F393-E0A9-E50E24DCCA9E";
@@ -370,14 +386,14 @@ static void stopPollTimerIfIdle(void) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    s_activeNavVC = self;
+    s_activeNavVC = (UIViewController *)self;
     s_activeApp = @"Apple Maps";
     ensurePollTimer();
     NSLog(@"[NavRelay] Apple Maps step card appeared");
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
-    if (s_activeNavVC == self) {
+    if (s_activeNavVC == (UIViewController *)self) {
         s_activeNavVC = nil;
         stopPollTimerIfIdle();
     }
@@ -411,12 +427,12 @@ static void stopPollTimerIfIdle(void) {
 - (void)didMoveToWindow {
     %orig;
     if (self.window) {
-        s_activeNavView = self;
+        s_activeNavView = (UIView *)self;
         s_activeApp = @"Google Maps";
         ensurePollTimer();
         NSLog(@"[NavRelay] Google Maps banner appeared");
     } else {
-        if (s_activeNavView == self) {
+        if (s_activeNavView == (UIView *)self) {
             s_activeNavView = nil;
             stopPollTimerIfIdle();
         }
@@ -436,12 +452,12 @@ static void stopPollTimerIfIdle(void) {
 - (void)didMoveToWindow {
     %orig;
     if (self.window) {
-        s_activeNavView = self;
+        s_activeNavView = (UIView *)self;
         s_activeApp = @"Yandex Navi";
         ensurePollTimer();
         NSLog(@"[NavRelay] Yandex turn view appeared");
     } else {
-        if (s_activeNavView == self) {
+        if (s_activeNavView == (UIView *)self) {
             s_activeNavView = nil;
             stopPollTimerIfIdle();
         }
