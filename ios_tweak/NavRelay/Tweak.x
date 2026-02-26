@@ -43,11 +43,6 @@
 @interface YMKTurnInstructionView : UIView
 @end
 
-/* Category for methods added via %new */
-@interface UIViewController (NavRelay)
-- (NSString *)dumpMethods;
-@end
-
 @interface MNStepCardViewController (NavRelay)
 - (NSString *)findLabelText:(UIView *)view tag:(NSInteger)depth;
 @end
@@ -100,19 +95,29 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _centralManager = [[CBCentralManager alloc]
-            initWithDelegate:self
-            queue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)
-            options:@{CBCentralManagerOptionRestoreIdentifierKey: @"NavRelayBLE"}];
         _isReady = NO;
-        NSLog(@"[NavRelay] BLE Manager initialized");
+        /* Delay BLE init — don't create CBCentralManager in constructor,
+         * wait until app is fully loaded to avoid UIBackgroundModes crash */
+        NSLog(@"[NavRelay] BLE Manager created (lazy init)");
     }
     return self;
+}
+
+- (void)ensureBLE {
+    if (self.centralManager) return;
+    /* Do NOT use CBCentralManagerOptionRestoreIdentifierKey — nav apps
+     * don't have bluetooth-central in UIBackgroundModes, causes crash */
+    self.centralManager = [[CBCentralManager alloc]
+        initWithDelegate:self
+        queue:dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0)
+        options:nil];
+    NSLog(@"[NavRelay] CBCentralManager initialized");
 }
 
 #pragma mark - Public API
 
 - (void)sendNavData:(NSString *)data {
+    [self ensureBLE];
     if (self.isReady && self.navCharacteristic) {
         NSData *bytes = [data dataUsingEncoding:NSUTF8StringEncoding];
         if (bytes.length > 512) {
@@ -136,8 +141,13 @@ typedef NS_ENUM(NSInteger, NavDirection) {
 #pragma mark - Connection
 
 - (void)tryConnect {
+    [self ensureBLE];
     if (self.connectedPeripheral && self.connectedPeripheral.state == CBPeripheralStateConnected) {
         return; /* Already connected */
+    }
+    if (self.centralManager.state != CBManagerStatePoweredOn) {
+        NSLog(@"[NavRelay] BLE not powered on yet, will retry on state change");
+        return;
     }
 
     /* Try to retrieve already-connected peripherals (iPhone connects for HID) */
@@ -171,18 +181,6 @@ typedef NS_ENUM(NSInteger, NavDirection) {
     NSLog(@"[NavRelay] BLE state: %ld", (long)central.state);
     if (central.state == CBManagerStatePoweredOn) {
         [self tryConnect];
-    }
-}
-
-- (void)centralManager:(CBCentralManager *)central
-    willRestoreState:(NSDictionary<NSString *,id> *)dict {
-    NSArray *peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey];
-    for (CBPeripheral *p in peripherals) {
-        if ([p.name containsString:@"HARPY"]) {
-            self.connectedPeripheral = p;
-            p.delegate = self;
-            NSLog(@"[NavRelay] Restored peripheral: %@", p.name);
-        }
     }
 }
 
@@ -357,6 +355,17 @@ static void sendManeuver(NSString *instruction, NSString *distance,
 /* Track last instruction to avoid duplicates */
 static NSString *lastInstruction = nil;
 
+/* Throttle: minimum interval between hook processing (seconds) */
+static CFAbsoluteTime lastHookTime = 0;
+static const CFAbsoluteTime kHookThrottleInterval = 0.5; /* 500ms */
+
+static BOOL shouldThrottle(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - lastHookTime < kHookThrottleInterval) return YES;
+    lastHookTime = now;
+    return NO;
+}
+
 /*
  * Hook: MNStepCardViewController (iOS 15-17)
  * Called when the turn card updates its maneuver view.
@@ -365,6 +374,9 @@ static NSString *lastInstruction = nil;
 
 - (void)viewDidLayoutSubviews {
     %orig;
+
+    /* Throttle to avoid performance issues */
+    if (shouldThrottle()) return;
 
     @try {
         /* Try to extract instruction from the step/maneuver model */
@@ -393,9 +405,9 @@ static NSString *lastInstruction = nil;
                 street = [maneuver performSelector:@selector(name)];
         }
 
-        /* Fallback: scan view hierarchy for labels */
+        /* Fallback: scan view hierarchy for labels (max 6 levels deep) */
         if (!instruction) {
-            instruction = [self findLabelText:self.view tag:100];
+            instruction = [self findLabelText:self.view tag:6];
         }
 
         if (instruction && ![instruction isEqualToString:lastInstruction]) {
@@ -458,6 +470,8 @@ static NSString *lastInstruction = nil;
 - (void)layoutSubviews {
     %orig;
 
+    if (shouldThrottle()) return;
+
     @try {
         NSString *instruction = nil;
         NSString *distance = nil;
@@ -514,6 +528,8 @@ static NSString *lastInstruction = nil;
 - (void)layoutSubviews {
     %orig;
 
+    if (shouldThrottle()) return;
+
     @try {
         NSString *instruction = nil;
         NSString *distance = nil;
@@ -549,83 +565,52 @@ static NSString *lastInstruction = nil;
 
 %end
 
-/* ==================== Universal Fallback Hook ==================== */
+/* ==================== Debug Logging (no UIViewController hook) ==================== */
 /*
- * Hooks UIViewController's viewDidLayoutSubviews for VCs whose
- * class name contains "Navigation", "Maneuver", or "Step".
- * This catches unknown navigation apps.
+ * The universal UIViewController hook was removed because it caused
+ * crashes — hooking viewDidLayoutSubviews on ALL VCs is too invasive.
+ *
+ * To find navigation-related class names for your iOS version, SSH
+ * into the device and run:
+ *   class-dump /Applications/Maps.app/Maps | grep -i 'step\|maneuver\|nav'
+ *
+ * Then add a targeted %hook for that specific class.
  */
-
-%hook UIViewController
-
-- (void)viewDidLayoutSubviews {
-    %orig;
-
-    @try {
-        NSString *className = NSStringFromClass([self class]);
-
-        /* Only process navigation-related VCs */
-        if (!([className containsString:@"Navigation"] ||
-              [className containsString:@"Maneuver"] ||
-              [className containsString:@"Step"] ||
-              [className containsString:@"TurnCard"] ||
-              [className containsString:@"Direction"])) {
-            return;
-        }
-
-        /* Log class name for debugging (helps find correct hooks) */
-        static NSMutableSet *loggedClasses = nil;
-        if (!loggedClasses) loggedClasses = [NSMutableSet set];
-        if (![loggedClasses containsObject:className]) {
-            [loggedClasses addObject:className];
-            NSLog(@"[NavRelay] Detected nav VC: %@ (methods: %@)",
-                  className, [self dumpMethods]);
-        }
-    } @catch (NSException *ex) {
-        /* Ignore */
-    }
-}
-
-%new
-- (NSString *)dumpMethods {
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList([self class], &count);
-    NSMutableArray *names = [NSMutableArray array];
-    int limit = MIN(count, 20);
-    for (int i = 0; i < limit; i++) {
-        [names addObject:NSStringFromSelector(method_getName(methods[i]))];
-    }
-    free(methods);
-    return [names componentsJoinedByString:@", "];
-}
-
-%end
 
 /* ==================== Tweak Initialization ==================== */
 
 %ctor {
-    NSLog(@"[NavRelay] Tweak loaded! Initializing BLE relay...");
-    [NavRelayBLE shared];
+    @autoreleasepool {
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        NSLog(@"[NavRelay] Tweak loaded in %@", bundleID);
 
-    /* Log all classes containing Nav/Step/Maneuver for debugging */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        int numClasses = objc_getClassList(NULL, 0);
-        Class *classes = (Class *)malloc(sizeof(Class) * numClasses);
-        objc_getClassList(classes, numClasses);
-
-        NSLog(@"[NavRelay] === Navigation-related classes ===");
-        for (int i = 0; i < numClasses; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            if ([name containsString:@"Navigation"] ||
-                [name containsString:@"Maneuver"] ||
-                [name containsString:@"StepCard"] ||
-                [name containsString:@"TurnBanner"] ||
-                [name containsString:@"MNStep"]) {
-                NSLog(@"[NavRelay]   → %@", name);
-            }
+        /* Only proceed if we're in a navigation app */
+        if (!bundleID) return;
+        NSArray *supportedApps = @[
+            @"com.apple.Maps",
+            @"com.google.Maps",
+            @"ru.yandex.yandexnavi",
+            @"ru.yandex.mobile.navigator",
+            @"ru.dublgis.dgismobile",
+            @"com.waze.iphone"
+        ];
+        BOOL supported = NO;
+        for (NSString *app in supportedApps) {
+            if ([bundleID isEqualToString:app]) { supported = YES; break; }
         }
-        free(classes);
-        NSLog(@"[NavRelay] === End class dump ===");
-    });
+        if (!supported) {
+            NSLog(@"[NavRelay] Unsupported app %@, not loading", bundleID);
+            return;
+        }
+
+        /* Create singleton (BLE init is lazy, won't happen until needed) */
+        [NavRelayBLE shared];
+
+        /* Delayed BLE init — wait for app to fully load */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            [[NavRelayBLE shared] ensureBLE];
+            NSLog(@"[NavRelay] BLE init triggered after app load");
+        });
+    }
 }
