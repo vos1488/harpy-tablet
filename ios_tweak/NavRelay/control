@@ -1,6 +1,6 @@
 Package: com.harpy.navrelay
 Name: NavRelay
-Version: 1.1.0
+Version: 1.2.0
 Architecture: iphoneos-arm
 Description: Relays turn-by-turn navigation from Apple Maps/Google Maps/Yandex to HARPY Remote (ESP32) via BLE.
 Maintainer: HARPY
