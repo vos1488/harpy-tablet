@@ -27,6 +27,31 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+/* ==================== Forward Declarations for Hooked Classes ==================== */
+
+@interface MNStepCardViewController : UIViewController
+- (id)currentStep;
+- (id)maneuver;
+@end
+
+@interface MNNavigationViewController : UIViewController
+@end
+
+@interface GMSNavigationBannerView : UIView
+@end
+
+@interface YMKTurnInstructionView : UIView
+@end
+
+/* Category for methods added via %new */
+@interface UIViewController (NavRelay)
+- (NSString *)dumpMethods;
+@end
+
+@interface MNStepCardViewController (NavRelay)
+- (NSString *)findLabelText:(UIView *)view tag:(NSInteger)depth;
+@end
+
 /* ==================== Constants ==================== */
 
 static NSString *const kESP32Name = @"HARPY Remote";
@@ -116,7 +141,6 @@ typedef NS_ENUM(NSInteger, NavDirection) {
     }
 
     /* Try to retrieve already-connected peripherals (iPhone connects for HID) */
-    CBUUID *navSvcUUID = [CBUUID UUIDWithString:kNavServiceUUID];
     CBUUID *hidSvcUUID = [CBUUID UUIDWithString:@"1812"];
 
     NSArray *connected = [self.centralManager retrieveConnectedPeripheralsWithServices:@[hidSvcUUID]];

@@ -16,6 +16,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = NavRelay
 NavRelay_FILES = Tweak.x
 NavRelay_FRAMEWORKS = CoreBluetooth CoreLocation UIKit Foundation
-NavRelay_CFLAGS = -fobjc-arc
+NavRelay_CFLAGS = -fobjc-arc -Wno-unused-variable
 
 include $(THEOS_MAKE_PATH)/tweak.mk
