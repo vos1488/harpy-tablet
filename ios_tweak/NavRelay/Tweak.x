@@ -450,18 +450,8 @@ static NSString *lastInstruction = nil;
 %end
 
 /* ==================== Google Maps Hooks ==================== */
-/*
- * Google Maps uses:
- *   - GMSx_GMSNavigationService (or GMSNavigationService)
- *   - GMSNavInstruction
- *   - GMSNavInstructionLabel
- *   - GMSNavigationBannerView
- *
- * Dump headers:
- *   class-dump /var/containers/Bundle/Application/*/Google\ Maps.app/Google\ Maps
- *
- * Alternative: Hook the navigation banner view controller
- */
+// Google Maps uses GMSNavigationBannerView, GMSNavInstruction, etc.
+// Use class-dump on the Google Maps binary to find exact class names.
 
 %hook GMSNavigationBannerView
 
